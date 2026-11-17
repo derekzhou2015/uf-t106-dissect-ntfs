@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import ntpath
 from functools import cached_property, lru_cache
 from io import BytesIO
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
     from dissect.ntfs.index import IndexEntry
     from dissect.ntfs.ntfs import NTFS
     from dissect.ntfs.util import AttributeCollection
+
+
+log = logging.getLogger(__name__)
 
 
 class Mft:
@@ -174,7 +178,11 @@ class Mft:
         for segment in range(start, end + step, step):
             try:
                 yield self.get(segment)
-            except Error:  # noqa: PERF203
+            except Error as e:  # noqa: PERF203
+                # Most of these are unallocated or stale segments without a valid signature, which is
+                # routine on any volume. Damaged records with a valid signature (e.g. broken fixup data)
+                # are additionally logged as a warning at the point of detection.
+                log.debug("Skipping invalid MFT record segment %d: %s", segment, e)
                 continue
             except EOFError:
                 break
@@ -230,7 +238,7 @@ class MftRecord:
             ntfs: An optional NTFS class instance.
 
         Raises:
-            BrokenMftError: If the MFT record signature is invalid.
+            BrokenMftError: If the MFT record signature or fixup data is invalid.
         """
         obj = cls()
         obj.ntfs = ntfs
@@ -238,7 +246,12 @@ class MftRecord:
         if data[:4] != b"FILE":
             raise BrokenMftError(f"Invalid MFT record Signature: {data[:4]}")
 
-        obj.data = apply_fixup(data)
+        try:
+            obj.data = apply_fixup(data)
+        except ValueError as e:
+            log.warning("MFT record has a valid signature but invalid fixup data: %s", e)
+            raise BrokenMftError(f"Invalid MFT record fixup: {e}") from e
+
         obj.header = c_ntfs._FILE_RECORD_SEGMENT_HEADER(obj.data)
         return obj
 

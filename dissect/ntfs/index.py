@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 from enum import Enum, auto
 from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, Any, BinaryIO
@@ -19,6 +20,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from dissect.ntfs.mft import MftRecord
+
+
+log = logging.getLogger(__name__)
 
 
 class Match(Enum):
@@ -133,9 +137,19 @@ class Index:
                             break
 
                         yield entry
-                except Error:
-                    pass
+                except Error as e:
+                    # Most of these are stale or uninitialized buffers without a valid signature, which
+                    # is routine on any volume. Damaged buffers with a valid signature (e.g. broken fixup
+                    # data or a corrupted entry stream) are additionally logged as a warning at the point
+                    # of detection.
+                    log.debug("Skipping invalid index buffer %d of index %s: %s", vcn, self.name, e)
                 except EOFError:
+                    if (vcn << self._vcn_size_shift) < (getattr(self._index_stream, "size", None) or 0):
+                        log.warning(
+                            "Unexpected end of index allocation %s at index buffer %d, expected more data",
+                            self.name,
+                            vcn,
+                        )
                     break
 
                 vcn += 1
@@ -197,7 +211,7 @@ class IndexBuffer:
 
     Raises:
         EOFError: If there's not enough data available to read an index buffer.
-        BrokenIndexError: If the index buffer doesn't start with the expected magic value.
+        BrokenIndexError: If the index buffer doesn't start with the expected magic value or has invalid fixup data.
     """
 
     def __init__(self, index: Index, fh: BinaryIO, offset: int, size: int):
@@ -214,7 +228,12 @@ class IndexBuffer:
         if buf[:4] != b"INDX":
             raise BrokenIndexError("Broken INDX header")
 
-        self.data = apply_fixup(buf)
+        try:
+            self.data = apply_fixup(buf)
+        except ValueError as e:
+            log.warning("Index buffer at offset %d has a valid signature but invalid fixup data: %s", offset, e)
+            raise BrokenIndexError(f"Invalid index buffer fixup: {e}") from e
+
         self.header = c_ntfs._INDEX_ALLOCATION_BUFFER(self.data)
 
     def entries(self) -> Iterator[IndexEntry]:
@@ -320,14 +339,28 @@ def _iter_entries(index: Index, fh: BinaryIO, offset: int, size: int) -> Iterato
     while offset < max_offset:
         try:
             entry = IndexEntry(index, fh, offset)
-        except EOFError:
-            break
-
-        yield entry
+        except EOFError as e:
+            # A valid entry stream is always terminated by an end entry, so hitting EOF
+            # means the stream was truncated or corrupted
+            log.warning("Index entry stream of index %s ends unexpectedly at offset %#x", index.name, offset)
+            raise BrokenIndexError(f"Unexpected end of index entries at offset {offset:#x}") from e
 
         if entry.is_end:
+            yield entry
             break
 
+        if entry.length < len(c_ntfs._INDEX_ENTRY) or offset + entry.length > max_offset:
+            # A non-end entry must at least contain its own header and fit within the entry stream,
+            # otherwise the entry stream is corrupted and we can not reliably advance to the next entry
+            log.warning(
+                "Index entry stream of index %s has invalid entry length %d at offset %#x",
+                index.name,
+                entry.length,
+                offset,
+            )
+            raise BrokenIndexError(f"Invalid index entry length {entry.length} at offset {offset:#x}")
+
+        yield entry
         offset += entry.length
 
 

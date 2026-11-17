@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import io
+import logging
 from typing import BinaryIO
 
 import pytest
 
 from dissect.ntfs.c_ntfs import FILE_NUMBER_MFT
-from dissect.ntfs.exceptions import MftNotAvailableError, VolumeNotAvailableError
+from dissect.ntfs.exceptions import BrokenMftError, MftNotAvailableError, VolumeNotAvailableError
 from dissect.ntfs.mft import Mft, MftRecord
 from dissect.ntfs.ntfs import NTFS
 
@@ -142,3 +143,38 @@ def test_mft_record_reparse_cloud_full(ntfs_cloud_bin: BinaryIO) -> None:
     assert record.is_cloud_file()
     assert record.is_file()
     assert record.open().read() == b"This is an example file in the OneDrive folder!\r\n"
+
+
+def test_mft_segments_broken_fixup_record(mft_bin: BinaryIO, caplog: pytest.LogCaptureFixture) -> None:
+    """Test that an MFT record with a valid signature but broken fixup data is skipped with a trace.
+
+    Simulates a torn write (e.g. from a power loss): the ``FILE`` signature is intact but the fixup
+    data is corrupted. Enumeration must skip the damaged record like any other broken record instead
+    of crashing with a generic ``ValueError``, and must leave a trace in the log.
+    """
+    data = bytearray(mft_bin.read())
+
+    # Find a record with a valid FILE signature at a segment boundary (records are 1024 bytes)
+    record_size = 1024
+    segment = next(
+        seg for seg in range(30, len(data) // record_size) if data[seg * record_size : seg * record_size + 4] == b"FILE"
+    )
+    offset = segment * record_size
+
+    # Corrupt the update sequence array offset (bytes 4-5) to an odd value, breaking the fixup
+    data[offset + 4] |= 0x01
+
+    fs = NTFS(mft=io.BytesIO(bytes(data)))
+    with caplog.at_level(logging.WARNING, logger="dissect.ntfs.mft"):
+        segments = list(fs.mft.segments())
+
+    # The damaged record is skipped, all other records are still enumerated
+    assert len(segments) == 36
+    assert segment not in [record.segment for record in segments]
+
+    # A trace of the skipped damaged record is left in the log
+    assert "invalid fixup data" in caplog.text
+
+    # Directly retrieving the damaged record raises the library's own parse exception, not a ValueError
+    with pytest.raises(BrokenMftError):
+        fs.mft.get(segment)
